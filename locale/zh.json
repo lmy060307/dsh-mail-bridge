@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "邮件桥",
+    "description": "通过 SMTP 与 IMAP 收发、浏览、阅读并下载 QQ 邮箱的邮件。"
+  }
+}

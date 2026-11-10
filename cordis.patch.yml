@@ -1,0 +1,3 @@
+- insert:
+    - id: mail-bridge
+      name: 'dsh-mail-bridge'

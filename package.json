@@ -1,0 +1,45 @@
+{
+  "name": "dsh-mail-bridge",
+  "version": "0.1.0",
+  "description": "在 DSH 里收发邮件：发送带附件的邮件、列出与读取收件箱、浏览文件夹、下载附件。默认适配 QQ 邮箱，可配置任意 SMTP/IMAP 服务。",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "email",
+    "smtp",
+    "imap",
+    "qq-mail"
+  ],
+  "type": "module",
+  "main": "index.js",
+  "icon": "./icon.svg",
+  "exports": {
+    ".": "./index.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "scripts/mail.py",
+    "locale/*.json",
+    "icon.svg",
+    "README.md",
+    "LICENSE"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lmy060307/dsh-mail-bridge.git"
+  },
+  "bugs": {
+    "url": "https://github.com/lmy060307/dsh-mail-bridge/issues"
+  },
+  "homepage": "https://github.com/lmy060307/dsh-mail-bridge#readme",
+  "license": "MIT"
+}
