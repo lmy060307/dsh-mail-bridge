@@ -246,14 +246,17 @@ def run_search(conn, criteria):
 
 
 
-def cmd_send(cfg):
+def build_message(cfg):
     msg = EmailMessage()
     msg["From"] = cfg.get("from") or cfg["user"]
-    to = cfg["to"]
-    msg["To"] = ", ".join(to) if isinstance(to, list) else to
-    if cfg.get("cc"):
-        cc = cfg["cc"]
+    to = cfg.get("to")
+    msg["To"] = ", ".join(to) if isinstance(to, list) else (to or "")
+    cc = cfg.get("cc")
+    if cc:
         msg["Cc"] = ", ".join(cc) if isinstance(cc, list) else cc
+    bcc = cfg.get("bcc")
+    if bcc:
+        msg["Bcc"] = ", ".join(bcc) if isinstance(bcc, list) else bcc
     msg["Subject"] = cfg.get("subject", "")
     if cfg.get("reply_to"):
         msg["Reply-To"] = cfg["reply_to"]
@@ -273,6 +276,10 @@ def cmd_send(cfg):
         with open(path, "rb") as fh:
             msg.add_attachment(fh.read(), maintype=maintype, subtype=subtype,
                                filename=os.path.basename(path))
+    return msg
+
+
+def deliver(cfg, msg):
     server = smtp_connect(cfg)
     try:
         refused = server.send_message(msg)
@@ -282,6 +289,126 @@ def cmd_send(cfg):
         except Exception:
             pass
     return {"sent": True, "refused": list(refused.keys()) if refused else []}
+
+
+def cmd_send(cfg):
+    return deliver(cfg, build_message(cfg))
+
+
+DRAFT_LINKS = {
+    "qq.com": "https://mail.qq.com/",
+    "foxmail.com": "https://mail.qq.com/",
+    "gmail.com": "https://mail.google.com/mail/u/0/#drafts",
+    "outlook.com": "https://outlook.live.com/mail/0/drafts",
+    "hotmail.com": "https://outlook.live.com/mail/0/drafts",
+    "163.com": "https://mail.163.com/",
+    "126.com": "https://mail.163.com/",
+}
+
+
+def draft_link(user):
+    domain = (user or "").split("@")[-1].strip().lower()
+    return DRAFT_LINKS.get(domain, "")
+
+
+def cmd_draft(cfg):
+    msg = build_message(cfg)
+    mailbox = cfg.get("draft_mailbox") or "Drafts"
+    conn = imap_connect(cfg)
+    try:
+        encoded = quoted(imap_utf7_encode(mailbox))
+        typ, data = conn.list('""', encoded)
+        if typ != "OK" or not any(data or []):
+            raise RuntimeError(f"draft mailbox not found: {mailbox}")
+        stamp = datetime.datetime.now().astimezone()
+        typ, data = conn.append(encoded, "(\\Draft)",
+                                imaplib.Time2Internaldate(stamp.timestamp()),
+                                msg.as_bytes())
+        if typ != "OK":
+            raise RuntimeError(f"APPEND failed: {status_text(data)}")
+        match = re.search(r"APPENDUID\s+\d+\s+(\d+)", status_text(data))
+        uid = match.group(1) if match else ""
+        return {
+            "uid": uid,
+            "mailbox": mailbox,
+            "to": msg["To"] or "",
+            "subject": msg["Subject"] or "",
+            "link": draft_link(cfg.get("user")),
+            "note": "Draft saved. Open the link, find it under Drafts, edit and send from there.",
+        }
+    finally:
+        try:
+            conn.logout()
+        except Exception:
+            pass
+
+
+def queue_path(cfg):
+    root = cfg.get("queueDir") or cfg.get("queue_dir") or os.path.join(
+        os.path.expanduser("~"), ".dsh", "mail-bridge", "queue")
+    os.makedirs(root, exist_ok=True)
+    return root
+
+
+def cmd_schedule(cfg):
+    when = cfg.get("send_at")
+    if not when:
+        raise RuntimeError("send_at is required")
+    stamp = parse_when(when)
+    if stamp is None:
+        raise RuntimeError(f"cannot parse send_at: {when}")
+    now = datetime.datetime.now().astimezone()
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=now.tzinfo)
+    root = queue_path(cfg)
+    job_id = "%s-%s" % (stamp.strftime("%Y%m%dT%H%M%S"),
+                        base64.b32encode(os.urandom(3)).decode().lower().rstrip("="))
+    payload = {key: cfg[key] for key in ("to", "cc", "bcc", "subject", "text", "html",
+                                         "attachments", "reply_to") if key in cfg}
+    job = {"id": job_id, "send_at": stamp.isoformat(), "created_at": now.isoformat(),
+           "payload": payload}
+    target = os.path.join(root, job_id + ".json")
+    with open(target, "w", encoding="utf-8") as fh:
+        json.dump(job, fh, ensure_ascii=False, indent=2)
+    return {"id": job_id, "send_at": job["send_at"], "to": payload.get("to"),
+            "subject": payload.get("subject", "")}
+
+
+def cmd_dispatch(cfg):
+    root = queue_path(cfg)
+    now = datetime.datetime.now().astimezone()
+    sent, failed, pending = [], [], 0
+    for name in sorted(os.listdir(root)):
+        if not name.endswith(".json"):
+            continue
+        path = os.path.join(root, name)
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                job = json.load(fh)
+            stamp = datetime.datetime.fromisoformat(job["send_at"])
+            if stamp.tzinfo is None:
+                stamp = stamp.replace(tzinfo=now.tzinfo)
+        except Exception as exc:  # noqa: BLE001
+            os.replace(path, path + ".broken")
+            failed.append({"id": name, "error": "%s: %s" % (type(exc).__name__, exc)})
+            continue
+        if stamp > now:
+            pending += 1
+            continue
+        try:
+            payload = dict(job["payload"])
+            for key in ("user", "pass", "smtp_host", "smtp_port", "from"):
+                if key in cfg and key not in payload:
+                    payload[key] = cfg[key]
+            result = cmd_send(payload)
+            os.remove(path)
+            sent.append({"id": name, "send_at": job["send_at"],
+                         "late": (now - stamp).total_seconds() > 60, "result": result})
+        except Exception as exc:  # noqa: BLE001
+            os.replace(path, path + ".failed")
+            failed.append({"id": name, "send_at": job["send_at"],
+                           "error": "%s: %s" % (type(exc).__name__, exc)})
+    return {"sent": sent, "failed": failed, "pending": pending}
 
 
 def cmd_list(cfg):
@@ -651,6 +778,9 @@ COMMANDS = {
     "search": cmd_search,
     "mark": cmd_mark,
     "move": cmd_move,
+    "draft": cmd_draft,
+    "schedule": cmd_schedule,
+    "dispatch": cmd_dispatch,
 }
 
 

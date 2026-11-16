@@ -278,6 +278,98 @@ export function apply(ctx, config) {
       },
     },
     {
+      name: 'mail_draft',
+      description:
+        'Save a message into the account Drafts mailbox instead of sending it, and return a web link where the user can open, edit and send it themselves.',
+      parameters: schema(
+        {
+          to: {
+            oneOf: [{ type: 'string' }, { type: 'array', items: { type: 'string' } }],
+            description: 'Recipient address, or a list of addresses.',
+          },
+          cc: {
+            oneOf: [{ type: 'string' }, { type: 'array', items: { type: 'string' } }],
+            description: 'Optional CC address or list.',
+          },
+          subject: { type: 'string', description: 'Subject line.' },
+          text: { type: 'string', description: 'Plain-text body.' },
+          html: { type: 'string', description: 'Optional HTML body.' },
+          attachments: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'Absolute file paths to attach.',
+          },
+          draft_mailbox: {
+            type: 'string',
+            description: 'Draft mailbox name; defaults to Drafts.',
+          },
+        },
+        ['to', 'subject'],
+      ),
+      output: {
+        schema: {
+          type: 'object',
+          properties: {
+            uid: { type: 'string' },
+            mailbox: { type: 'string' },
+            to: { type: 'string' },
+            subject: { type: 'string' },
+            link: { type: 'string' },
+            note: { type: 'string' },
+          },
+        },
+        render: textRender,
+      },
+      async execute(args, exec) {
+        return run('draft', args, exec.signal)
+      },
+    },
+    {
+      name: 'mail_schedule',
+      description:
+        'Queue an email for later delivery. send_at accepts ISO 8601 or "YYYY-MM-DD HH:mm" in local time. Due jobs are sent within about a minute while the plugin runs, and jobs missed while DSH was closed are sent on next start.',
+      parameters: schema(
+        {
+          to: {
+            oneOf: [{ type: 'string' }, { type: 'array', items: { type: 'string' } }],
+            description: 'Recipient address, or a list of addresses.',
+          },
+          cc: {
+            oneOf: [{ type: 'string' }, { type: 'array', items: { type: 'string' } }],
+            description: 'Optional CC address or list.',
+          },
+          subject: { type: 'string', description: 'Subject line.' },
+          text: { type: 'string', description: 'Plain-text body.' },
+          html: { type: 'string', description: 'Optional HTML body.' },
+          attachments: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'Absolute file paths to attach.',
+          },
+          send_at: {
+            type: 'string',
+            description: 'When to send it: ISO 8601, or YYYY-MM-DD HH:mm in local time.',
+          },
+        },
+        ['to', 'subject', 'send_at'],
+      ),
+      output: {
+        schema: {
+          type: 'object',
+          properties: {
+            id: { type: 'string' },
+            send_at: { type: 'string' },
+            to: { type: 'string' },
+            subject: { type: 'string' },
+          },
+        },
+        render: textRender,
+      },
+      async execute(args, exec) {
+        return run('schedule', args, exec.signal)
+      },
+    },
+    {
       name: 'mail_folders',
       description: 'List the mailboxes (folders) available on the IMAP account.',
       parameters: schema({}, []),
@@ -293,6 +385,24 @@ export function apply(ctx, config) {
       },
     },
   ]
+
+  const queueDir =
+    settings.queueDir ??
+    path.join(process.env.DSH_PROFILE_DIR ?? path.join(os.homedir(), '.dsh'), 'mail-bridge-queue')
+
+  ctx.effect(() => {
+    const tick = () => {
+      run('dispatch', { queueDir }).catch(() => {})
+    }
+    const timer = setInterval(tick, 60_000)
+    if (typeof timer.unref === 'function') timer.unref()
+    const warmup = setTimeout(tick, 3_000)
+    if (typeof warmup.unref === 'function') warmup.unref()
+    return () => {
+      clearInterval(timer)
+      clearTimeout(warmup)
+    }
+  })
 
   for (const tool of tools) {
     ctx.effect(() => ctx.tools.register(tool))
