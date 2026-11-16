@@ -8,6 +8,7 @@ Every command receives account settings plus command-specific fields and
 writes one JSON object to the output file. Never prints secrets.
 """
 import base64
+import datetime
 import email
 import email.header
 import email.utils
@@ -68,6 +69,33 @@ def imap_utf7_decode(value):
         i = end + 1
     return "".join(out)
 
+def imap_utf7_encode(name):
+    """Encode a mailbox name into IMAP modified UTF-7."""
+    out = []
+    buffer = []
+
+    def flush():
+        if not buffer:
+            return
+        raw = "".join(buffer).encode("utf-16-be")
+        token = base64.b64encode(raw).decode("ascii").rstrip("=").replace("/", ",")
+        out.append("&" + token + "-")
+        del buffer[:]
+
+    for char in name:
+        code = ord(char)
+        if char == "&":
+            flush()
+            out.append("&-")
+        elif 0x20 <= code <= 0x7E:
+            flush()
+            out.append(char)
+        else:
+            buffer.append(char)
+    flush()
+    return "".join(out)
+
+
 
 def to_iso(value):
     try:
@@ -124,22 +152,98 @@ def smtp_connect(cfg):
     return server
 
 
-def mailbox_for(conn, name):
+def mailbox_for(conn, name, readonly=True):
     """Select a mailbox, accepting either raw name or UTF-7 encoded name."""
     candidates = [name]
     try:
-        candidates.append(imaplib.IMAP4.encode(name))
+        candidates.append(imap_utf7_encode(name))
     except Exception:
         pass
     last = None
     for candidate in candidates:
         try:
-            typ, data = conn.select(f'"{candidate}"', readonly=True)
+            typ, data = conn.select(f'"{candidate}"', readonly=readonly)
             if typ == "OK":
                 return
         except Exception as exc:  # noqa: BLE001
             last = exc
     raise RuntimeError(f"cannot select mailbox {name!r}: {last}")
+
+
+MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun",
+          "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+
+
+def imap_date(value):
+    """Accept YYYY-MM-DD or DD-Mon-YYYY and return the IMAP date form."""
+    text = str(value).strip()
+    match = re.match(r"^(\d{4})-(\d{2})-(\d{2})$", text)
+    if not match:
+        return text
+    year, month, day = match.groups()
+    return f"{day}-{MONTHS[int(month) - 1]}-{year}"
+
+
+def quoted(value):
+    """Quote one IMAP search argument."""
+    escaped = str(value).replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def search_criteria(cfg):
+    criteria = []
+    for key, prefix in (("from", "FROM"), ("to", "TO"),
+                        ("subject", "SUBJECT"), ("text", "TEXT")):
+        value = cfg.get(key)
+        if value:
+            criteria.extend([prefix, quoted(value)])
+    if cfg.get("since"):
+        criteria.extend(["SINCE", quoted(imap_date(cfg["since"]))])
+    if cfg.get("before"):
+        criteria.extend(["BEFORE", quoted(imap_date(cfg["before"]))])
+    return criteria
+
+
+def parse_when(value):
+    """Parse an RFC 2822 or ISO-8601 timestamp into an aware datetime."""
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return email.utils.parsedate_to_datetime(text)
+    except (TypeError, ValueError):
+        pass
+    try:
+        return datetime.datetime.fromisoformat(text)
+    except ValueError:
+        return None
+
+
+def describe(conn, uid, raw_meta, header_bytes):
+    message = email.message_from_bytes(header_bytes or b"")
+    stamp = parse_when(decode_header(message.get("Date")))
+    return {
+        "uid": uid.decode() if isinstance(uid, bytes) else str(uid),
+        "from": decode_header(message.get("From")),
+        "to": decode_header(message.get("To")),
+        "subject": decode_header(message.get("Subject")),
+        "date": stamp.astimezone().isoformat() if stamp else internal_date(raw_meta),
+    }
+
+
+
+def run_search(conn, criteria):
+    """Server-side SEARCH; falls back when the server refuses UTF-8."""
+    try:
+        typ, data = conn.uid("SEARCH", "CHARSET", "UTF-8", *criteria)
+    except UnicodeEncodeError:
+        typ, data = conn.uid("SEARCH", *criteria)
+    if typ != "OK":
+        head = data[0] if data else b""
+        reason = head.decode("utf-8", "replace") if isinstance(head, bytes) else str(head)
+        raise RuntimeError(f"server refused search: {reason}")
+    return (data[0] or b"").split(), True
+
 
 
 def cmd_send(cfg):
@@ -258,7 +362,7 @@ def cmd_read(cfg):
     }
 
 
-def cmd_download(cfg):
+def download_one(cfg):
     conn = imap_connect(cfg)
     try:
         mailbox_for(conn, cfg.get("mailbox") or "INBOX")
@@ -293,6 +397,226 @@ def cmd_download(cfg):
     return {"uid": str(cfg["uid"]), "saved": saved}
 
 
+def cmd_download(cfg):
+    uids = uid_list(cfg)
+    if not uids:
+        raise RuntimeError("download needs uid or uids")
+    results, all_saved = [], []
+    for uid in uids:
+        sub = dict(cfg)
+        sub.pop("uids", None)
+        sub["uid"] = uid
+        data = download_one(sub)
+        results.append({"uid": uid, "saved": data["saved"]})
+        all_saved.extend(data["saved"])
+    return {"uid": uids[0], "uids": uids, "saved": all_saved, "results": results}
+
+
+def fetch_headers(conn, uid):
+    """Fetch one message header; returns a record dict or None."""
+    uid = uid.decode() if isinstance(uid, bytes) else str(uid)
+    typ, raw = conn.uid("FETCH", uid,
+                        "(UID INTERNALDATE BODY.PEEK[HEADER.FIELDS (FROM TO SUBJECT DATE)])")
+    if typ != "OK" or not raw or not isinstance(raw[0], tuple):
+        return None
+    meta, header = raw[0][0], raw[0][1]
+    match = re.search(rb"UID (\d+)", meta)
+    actual = match.group(1) if match else uid
+    return describe(conn, actual, meta, header)
+
+
+def fetch_header_batch(conn, uids):
+    """Fetch headers for many uids with a few round trips."""
+    records = []
+    for start in range(0, len(uids), 80):
+        chunk = [u.decode() if isinstance(u, bytes) else str(u)
+                 for u in uids[start:start + 80]]
+        typ, data = conn.uid(
+            "FETCH", ",".join(chunk),
+            "(UID INTERNALDATE BODY.PEEK[HEADER.FIELDS (FROM TO SUBJECT DATE)])")
+        if typ != "OK":
+            continue
+        for item in data or []:
+            if not isinstance(item, tuple):
+                continue
+            meta, header = item
+            match = re.search(rb"UID (\d+)", meta)
+            if not match:
+                continue
+            records.append(describe(conn, match.group(1), meta, header))
+    return records
+
+
+def fetch_body_text(conn, uid):
+    try:
+        typ, data = conn.uid("FETCH", uid, "(BODY.PEEK[TEXT])")
+    except imaplib.IMAP4.error:
+        return ""
+    if typ != "OK" or not data or not isinstance(data[0], tuple):
+        return ""
+    return data[0][1].decode("utf-8", "replace")
+
+
+def local_search(conn, cfg, scan_limit):
+    """Fallback: pull recent headers, filter them in Python."""
+    typ, data = conn.uid("SEARCH", None, "ALL")
+    uids = (data[0] or b"").split() if data else []
+    recent = uids[-scan_limit:]
+    wants = {key: (cfg.get(key) or "").strip().lower()
+             for key in ("from", "to", "subject", "text")}
+    since = str(cfg.get("since") or "")
+    before = str(cfg.get("before") or "")
+    records = fetch_header_batch(conn, recent)
+    records.sort(key=lambda item: int(item["uid"]), reverse=True)
+    hits = []
+    for record in records:
+        if wants["from"] and wants["from"] not in record["from"].lower():
+            continue
+        if wants["to"] and wants["to"] not in record["to"].lower():
+            continue
+        if wants["subject"] and wants["subject"] not in record["subject"].lower():
+            continue
+        if since or before:
+            stamp = parse_when(record["date"])
+            if stamp is None:
+                continue
+            day = stamp.date().isoformat()
+            if since and day < since:
+                continue
+            if before and day >= before:
+                continue
+        if wants["text"] and wants["text"] not in fetch_body_text(conn, record["uid"]).lower():
+            continue
+        hits.append(record)
+    return hits
+
+
+def cmd_search(cfg):
+    mailbox = cfg.get("mailbox") or "INBOX"
+    limit = int(cfg.get("limit", 20))
+    scan_limit = int(cfg.get("scan_limit", 500))
+    conn = imap_connect(cfg)
+    try:
+        mailbox_for(conn, mailbox)
+        criteria = search_criteria(cfg)
+        if not criteria:
+            raise RuntimeError("search needs one of: from, to, subject, text, since, before")
+        note = ""
+        typ, data = conn.uid("SEARCH", None, "ALL")
+        all_uids = (data[0] or b"").split() if data else []
+        matched = []
+        try:
+            matched, _ok = run_search(conn, criteria)
+            if len(matched) >= len(all_uids) > 1:
+                raise RuntimeError("server matched every message")
+        except RuntimeError as exc:
+            note = f"{exc}; scanned {min(scan_limit, len(all_uids))} recent messages locally"
+            records = local_search(conn, cfg, scan_limit)
+            return {"mailbox": mailbox, "matched": len(records),
+                    "messages": records[:limit], "note": note}
+        records = []
+        for uid in matched[-limit:][::-1]:
+            record = fetch_headers(conn, uid)
+            if record is not None:
+                records.append(record)
+        return {"mailbox": mailbox, "matched": len(matched), "messages": records,
+                "note": note}
+    finally:
+        try:
+            conn.logout()
+        except Exception:
+            pass
+
+
+
+def uid_list(cfg):
+    uids = cfg.get("uids")
+    if uids:
+        return [str(item) for item in uids]
+    if cfg.get("uid"):
+        return [str(cfg["uid"])]
+    return []
+
+
+def cmd_mark(cfg):
+    uids = uid_list(cfg)
+    if not uids:
+        raise RuntimeError("mark needs uid or uids")
+    changes = []
+    if "read" in cfg and cfg["read"] is not None:
+        changes.append(("\\Seen", bool(cfg["read"])))
+    if "flagged" in cfg and cfg["flagged"] is not None:
+        changes.append(("\\Flagged", bool(cfg["flagged"])))
+    if not changes:
+        raise RuntimeError("mark needs read and/or flagged")
+    conn = imap_connect(cfg)
+    updated = []
+    try:
+        mailbox_for(conn, cfg.get("mailbox") or "INBOX", readonly=False)
+        for uid in uids:
+            uid = uid.decode() if isinstance(uid, bytes) else str(uid)
+            for flag, enabled in changes:
+                conn.uid("STORE", uid, "+FLAGS" if enabled else "-FLAGS", f"({flag})")
+            updated.append(uid)
+        return {"updated": updated}
+    finally:
+        try:
+            conn.logout()
+        except Exception:
+            pass
+
+
+def status_text(data):
+    if not data:
+        return "unknown IMAP error"
+    first = data[0]
+    return first.decode("utf-8", "replace") if isinstance(first, bytes) else str(first)
+
+
+def cmd_move(cfg):
+    uids = uid_list(cfg)
+    target = cfg.get("to")
+    if not uids or not target:
+        raise RuntimeError("move needs uid/uids and a destination in 'to'")
+    encoded = quoted(imap_utf7_encode(target))
+    conn = imap_connect(cfg)
+    moved, failed, reasons = [], [], []
+    try:
+        mailbox_for(conn, cfg.get("mailbox") or "INBOX", readonly=False)
+        for uid in uids:
+            uid = uid.decode() if isinstance(uid, bytes) else str(uid)
+            try:
+                typ, data = conn.uid("MOVE", uid, encoded)
+                if typ == "OK":
+                    moved.append(uid)
+                    continue
+                reasons.append(status_text(data))
+            except imaplib.IMAP4.error as exc:
+                reasons.append(str(exc))
+            try:
+                typ, data = conn.uid("COPY", uid, encoded)
+                if typ != "OK":
+                    reasons.append(status_text(data))
+                    failed.append(uid)
+                    continue
+                conn.uid("STORE", uid, "+FLAGS", "(\\Deleted)")
+                try:
+                    conn.uid("EXPUNGE", uid)
+                except imaplib.IMAP4.error:
+                    conn.expunge()
+                moved.append(uid)
+            except imaplib.IMAP4.error as exc:
+                failed.append(f"{uid}: {exc}")
+        return {"moved": moved, "failed": failed, "to": target,
+                "note": "; ".join(sorted(set(reasons)))}
+    finally:
+        try:
+            conn.logout()
+        except Exception:
+            pass
+
+
+
 def cmd_folders(cfg):
     conn = imap_connect(cfg)
     try:
@@ -324,6 +648,9 @@ COMMANDS = {
     "read": cmd_read,
     "download": cmd_download,
     "folders": cmd_folders,
+    "search": cmd_search,
+    "mark": cmd_mark,
+    "move": cmd_move,
 }
 
 

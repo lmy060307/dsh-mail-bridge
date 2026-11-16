@@ -155,27 +155,126 @@ export function apply(ctx, config) {
     },
     {
       name: 'mail_download',
-      description: 'Save every attachment of one message to a directory and return the saved paths.',
+      description:
+        'Save every attachment of one or more messages to a directory and return the saved paths. Pass uid for a single message or uids for several.',
       parameters: schema(
         {
           uid: { type: 'string', description: 'Message uid from mail_list.' },
+          uids: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'Download the attachments of several messages at once.',
+          },
           output_dir: { type: 'string', description: 'Absolute directory to write attachments into.' },
           mailbox: { type: 'string', description: 'Mailbox name, default INBOX.' },
         },
-        ['uid', 'output_dir'],
+        ['output_dir'],
       ),
       output: {
         schema: {
           type: 'object',
           properties: {
             uid: { type: 'string' },
+            uids: { type: 'array', items: { type: 'string' } },
             saved: { type: 'array', items: { type: 'object' } },
+            results: { type: 'array', items: { type: 'object' } },
           },
         },
         render: textRender,
       },
       async execute(args, exec) {
         return run('download', args, exec.signal)
+      },
+    },
+    {
+      name: 'mail_search',
+      description:
+        'Search messages in a mailbox by sender, recipient, subject, body text or date range. Falls back to scanning recent messages when the server rejects the search.',
+      parameters: schema(
+        {
+          from: { type: 'string', description: 'Match the From header (substring).' },
+          to: { type: 'string', description: 'Match the To header (substring).' },
+          subject: { type: 'string', description: 'Match the subject (substring).' },
+          text: { type: 'string', description: 'Match the message body (substring).' },
+          since: { type: 'string', description: 'Earliest date, YYYY-MM-DD.' },
+          before: { type: 'string', description: 'Latest date (exclusive), YYYY-MM-DD.' },
+          limit: { type: 'integer', description: 'Max results, default 20.' },
+          scan_limit: { type: 'integer', description: 'Messages scanned in local fallback, default 500.' },
+          mailbox: { type: 'string', description: 'Mailbox name, default INBOX.' },
+        },
+        [],
+      ),
+      output: {
+        schema: {
+          type: 'object',
+          properties: {
+            mailbox: { type: 'string' },
+            matched: { type: 'integer' },
+            messages: { type: 'array', items: { type: 'object' } },
+            note: { type: 'string' },
+          },
+        },
+        render: textRender,
+      },
+      async execute(args, exec) {
+        return run('search', args, exec.signal)
+      },
+    },
+    {
+      name: 'mail_mark',
+      description:
+        'Change flags on one or more messages: mark read/unread, or set/clear the star.',
+      parameters: schema(
+        {
+          uid: { type: 'string', description: 'Message uid from mail_list.' },
+          uids: { type: 'array', items: { type: 'string' }, description: 'Apply to several messages.' },
+          read: { type: 'boolean', description: 'true marks read, false marks unread.' },
+          flagged: { type: 'boolean', description: 'true stars the message, false removes the star.' },
+          mailbox: { type: 'string', description: 'Mailbox name, default INBOX.' },
+        },
+        [],
+      ),
+      output: {
+        schema: {
+          type: 'object',
+          properties: { updated: { type: 'array', items: { type: 'string' } } },
+        },
+        render: textRender,
+      },
+      async execute(args, exec) {
+        return run('mark', args, exec.signal)
+      },
+    },
+    {
+      name: 'mail_move',
+      description:
+        'Move one or more messages to another mailbox. Falls back to copy + delete when the server has no MOVE support.',
+      parameters: schema(
+        {
+          uid: { type: 'string', description: 'Message uid from mail_list.' },
+          uids: { type: 'array', items: { type: 'string' }, description: 'Move several messages.' },
+          to: {
+            type: 'string',
+            description: 'Destination mailbox name, for example a folder returned by mail_folders.',
+          },
+          mailbox: { type: 'string', description: 'Source mailbox, default INBOX.' },
+        },
+        ['to'],
+      ),
+      output: {
+        schema: {
+          type: 'object',
+          properties: {
+            moved: { type: 'array', items: { type: 'string' } },
+            failed: { type: 'array', items: { type: 'string' } },
+            to: { type: 'string' },
+            note: { type: 'string' },
+          },
+        },
+        render: textRender,
+      },
+      async execute(args, exec) {
+        return run('move', args, exec.signal)
       },
     },
     {

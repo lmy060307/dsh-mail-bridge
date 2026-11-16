@@ -1,7 +1,7 @@
 {
   "name": "dsh-mail-bridge",
-  "version": "0.1.0",
-  "description": "在 DSH 里收发邮件：发送带附件的邮件、列出与读取收件箱、浏览文件夹、下载附件。默认适配 QQ 邮箱，可配置任意 SMTP/IMAP 服务。",
+  "version": "0.2.0",
+  "description": "在 DSH 里收发邮件：发信（可带附件）、收件箱列表与读信、按发件人/主题/正文/日期搜索、标记已读与星标、批量下载附件、文件夹列表。默认适配 QQ 邮箱，可配置任意 SMTP/IMAP 服务。",
   "keywords": [
     "dsh",
     "dsh-plugin",
